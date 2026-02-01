@@ -56,7 +56,7 @@ recommender_systems_hw_1/
 
 1. **Clone the repository:**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/ladislve/recommender_systems_hw_1.git
    cd recommender_systems_hw_1
    ```
 
