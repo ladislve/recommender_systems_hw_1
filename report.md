@@ -1,76 +1,155 @@
-# Report: Recommender Systems Analysis
+# Report: Recommender Systems — Part 1
 
-## 1. Performance Comparison & Methodology Analysis
+## 1. Dataset & Evaluation Setup
 
-We implemented and evaluated three distinct families of recommender systems: Content-Based Filtering, Memory-Based Collaborative Filtering, and Model-Based Matrix Factorization. 
+We work with **MovieLens 1M**: 1,000,209 ratings from 6,040 users on 3,706 movies. Ratings are on a 1–5 integer scale. Every rating carries a timestamp.
 
-### Why Item-Item CF Outperformed Others
-The **Item-Item Collaborative Filtering (Jaccard)** emerged as the clear winner in terms of ranking accuracy (NDCG@10 = 0.0625). This dominance can be attributed to several factors specific to the MovieLens dataset:
+The user-item matrix is **95.5% sparse** — the average user rated ~166 out of 3,706 movies. Both user activity and item popularity follow a power-law distribution: a small number of "power users" contributed thousands of ratings, and a handful of blockbusters received the majority of all ratings. About 19% of movies have fewer than 20 ratings — the cold-start zone.
 
-1.  **Nature of Interaction:** The Jaccard similarity, when applied to a binary threshold (Rating ≥ 4.0), effectively captured the "co-liking" signal. It turns out that knowing *whether* two items are liked by the same people is a more robust predictor for ranking than estimating *how much* they are liked (which Adjusted Cosine and FunkSVD attempt to do).
-2.  **Stability of Item Correlations:** In movie domains, item correlations (e.g., people who like "Star Wars" also like "Empire Strikes Back") are stable and strong. Item-Item CF directly exploits these explicit graphs.
-3.  **Objective Mismatch in MF:** Matrix Factorization models (FunkSVD) optimized for RMSE (rating prediction error). A model can have a low RMSE (predicting a 3.8 when the truth is 4.0) but still fail at ranking (ordering items correctly in a top-10 list). Item-Item CF was tuned specifically for top-K retrieval.
+### Evaluation Protocol
 
-### The Trade-off: Accuracy vs. Coverage
-A distinct trade-off emerged between accuracy and catalog coverage:
-*   **Item-Item CF:** High Accuracy, Low Coverage (12%). It tends to reinforce satisfying, safe recommendations.
-*   **ALS (Matrix Estimation):** Low Accuracy, High Coverage (85%). It effectively spreads probability density across the "long tail," but often recommends obscure items that users in the test set didn't interact with, leading to "false negatives" in offline evaluation (the user might have liked it, but we don't know).
+All models share a single evaluation protocol:
 
-## 2. Failure Analysis
+- **Per-user temporal split (80/10/10):** For each user, we sort their ratings by timestamp. The earliest 80% go to training, the next 10% to validation, and the final 10% to the test set. This prevents data leakage — we always train on past behavior and evaluate on future behavior.
+- **Relevance threshold:** A rating ≥ 4.0 counts as relevant.
+- **Primary metric:** NDCG@K — measures how well relevant items are ranked near the top of the recommendation list.
+- **Secondary metrics:** Recall@K, Precision@K, Coverage (fraction of catalog appearing across all recommendations), and Popularity Bias (average popularity of recommended items).
+- **K values:** 5, 10, 20. We report K=10 as the primary comparison point.
+- All metrics are **averaged per user**, so power users do not dominate.
 
-| Model Family | Primary Failure Scenario | Reason |
-|--------------|-------------------------|--------|
-| **Collaborative Filtering (Item-Item)** | **Cold-Start Items** | Cannot recommend an item until it has been rated by other users. It is blind to 19% of the catalog (items with <20 ratings). |
-| **Content-Based Filtering** | **The "Filter Bubble"** | Fails to provide serendipity. If a user only watched interaction-heavy Sci-Fi, it will never recommend a great Drama, even if the user would love it. It lacks the "wisdom of the crowd." |
-| **Matrix Factorization (FunkSVD)** | **The "Gray Sheep"** | Struggles with users whose tastes are eclectic or inconsistent with the dominant latent factors. It forces users into a fixed-dimensional space which may not capture unique idiosyncrasies. |
-| **Popularity Baseline** | **Niche Users** | Completely fails for users with specific, non-mainstream tastes (e.g., horror cult classics), offering zero personalization. |
+---
 
-## 3. Bias Analysis
+## 2. Models Implemented
+
+We implemented three families of recommenders plus a Popularity baseline.
+
+### 2.1 Content-Based Filtering
+
+Each movie is represented as a feature vector. The user profile is built by aggregating feature vectors of movies the user rated, weighted by `(rating − mean_rating)`.
+
+**Basic CB:** Binary genre vectors (18 genres). We tested Jaccard, Cosine, and Pearson similarity between user profiles and item vectors. This performed poorly because genre is a coarse feature — many movies share the same genre vector.
+
+**Enhanced CB:** TF-IDF weighted genre features + decade feature + popularity blending. The TF-IDF weighting helps: rare genres like "Film-Noir" get higher weight than common genres like "Drama." We also added a `popularity_weight = 0.5` term that blends the content score with a popularity score. This was necessary because on this dataset, knowing what's popular is almost as informative as knowing genre preferences.
+
+### 2.2 Item-Item Collaborative Filtering
+
+Computes item-item similarity from user co-interaction patterns. We compared two similarity functions:
+
+- **Jaccard similarity** on binarized interactions (rating ≥ 4.0): `|users who liked both| / |users who liked either|`
+- **Adjusted Cosine similarity** on raw ratings
+
+Jaccard was better. Binarizing at threshold 4.0 strips out noise from mediocre ratings and focuses on strong positive signals. Adjusted Cosine tries to use the actual rating values, but the extra precision hurts more than it helps — users are inconsistent raters.
+
+**Hyperparameters:** K=50 nearest neighbors per item, min_cooccurrence=2. The top-50 neighbors and similarities are precomputed offline. At inference, for each user, we look up the neighbors of their liked items, aggregate weighted scores, and return the top-K.
+
+### 2.3 Matrix Factorization
+
+Both models decompose the rating matrix into user factors P and item factors Q, predict `r̂ = μ + b_u + b_i + P_u · Q_i`, and minimize MSE.
+
+**FunkSVD:** SGD-based. Hyperparameters: n_factors=30, lr=0.005, reg=0.02, 20 epochs. Initialization: N(0, 0.1). Global bias μ = mean training rating. Compiled via Numba (`@njit(parallel=True, fastmath=True)`) — each epoch iterates over all interactions, shuffled, updating user/item factors and biases with gradient descent.
+
+**ALS (Alternating Least Squares):** Closed-form alternating optimization. Hyperparameters: n_factors=60, reg=0.1, 15 iterations. Each iteration: fix item factors → solve `(Q^T Q + λI) P_u = Q^T r_u` for each user; fix user factors → solve the analogous system for each item. More stable convergence than SGD, but higher per-iteration cost.
+
+Both models optimize **RMSE** (rating prediction error), while we evaluate on **NDCG** (ranking quality). This is a fundamental mismatch: a model can predict ratings accurately (3.8 vs true 4.0) but still fail at ranking (placing irrelevant items above relevant ones in the top-10). This explains their weak performance below.
+
+### 2.4 Popularity Baseline
+
+Simply counts the number of ratings per movie (`groupby('item_id').size()`) and recommends the most-rated ones. All ratings count regardless of value — a movie with 500 one-star ratings and one with 500 five-star ratings get the same score.
+
+---
+
+## 3. Part 1 Results
+
+| Model | NDCG@5 | NDCG@10 | NDCG@20 | Precision@10 | Recall@10 | Coverage | Pop. Bias |
+|-------|--------|---------|---------|-------------|-----------|----------|----------|
+| **Item-Item CF (Jaccard)** | **0.0562** | **0.0625** | **0.0770** | **0.0457** | **0.0593** | 19.7% | 1681 |
+| Popularity | 0.0437 | 0.0490 | 0.0615 | 0.0393 | 0.0433 | 5.1% | 2086 |
+| Enhanced CB | 0.0391 | 0.0460 | 0.0577 | 0.0302 | 0.0495 | 40.4% | 978 |
+| FunkSVD | 0.0245 | 0.0265 | 0.0313 | 0.0218 | 0.0223 | 16.8% | 799 |
+| ALS | 0.0196 | 0.0219 | 0.0271 | 0.0173 | 0.0185 | 84.5% | 470 |
+| Basic CB | 0.0073 | 0.0087 | 0.0116 | 0.0064 | 0.0090 | 100.2% | 237 |
+
+### Key observations
+
+**Item-Item CF is the clear Part 1 winner.** NDCG@10 = 0.0625 — roughly 28% better than the Popularity baseline. The Jaccard similarity on binarized interactions was the right choice for this dataset: it captures the "co-liking" signal cleanly.
+
+**The Popularity baseline is surprisingly strong.** NDCG@10 = 0.049 just from recommending the most popular movies. Enhanced CB (0.046) barely beats it, and half of the Enhanced CB's signal actually comes from its popularity_weight term. This tells us that on MovieLens, "what's popular" is a very informative feature.
+
+**Matrix Factorization underperforms.** FunkSVD (0.0265) and ALS (0.0219) rank below even Popularity. The reason is **objective mismatch**: they optimize MSE on rating prediction, but we measure NDCG on ranking. A model that predicts "you'd rate this 3.8" for every movie produces low RMSE but useless rankings.
+
+**Basic CB is the worst model.** NDCG@10 = 0.0087. Binary genre vectors are too coarse — many movies share identical genre vectors, making personalization near-random. However, it achieves 100.2% coverage — slightly above 100% — because CB scores items using only genre metadata, not interaction history. This means it can recommend movies that appear in validation or test data but have zero training ratings. Those items are not counted in the training catalog denominator, so the ratio of unique recommended items to catalog size can marginally exceed 1.0.
+
+### The accuracy–coverage trade-off
+
+This is the most important structural finding:
+
+| Model | NDCG@10 | Coverage |
+|-------|---------|----------|
+| Item-Item CF | 0.0625 | 19.7% |
+| ALS | 0.0219 | 84.5% |
+| Basic CB | 0.0087 | 100.2% |
+
+High accuracy models (Item-Item CF) collapse into a narrow set of popular items — only 730 out of 3,706 movies ever get recommended. High coverage models (ALS, Basic CB) spread recommendations across the catalog but sacrifice ranking quality. No single model wins both dimensions.
+
+---
+
+## 4. Failure Analysis
+
+| Model | Primary Failure | Root Cause |
+|-------|----------------|------------|
+| **Item-Item CF** | Cold-start items | Cannot compute similarity for items with <20 ratings (19% of catalog). Needs co-interaction data. |
+| **Content-Based** | Filter bubble | Only recommends movies similar to what the user already watched. A Sci-Fi fan will never see a Drama recommendation, even a great one. |
+| **FunkSVD** | Users with mixed tastes | A user who likes both arthouse cinema and action blockbusters doesn't fit neatly into 30 latent dimensions. The model averages their preferences, losing the signal for both. |
+| **ALS** | Misleading offline results | Recommends many lesser-known items that users may have enjoyed but didn't rate in the test set. Offline metrics count this as error, but in a live system these could be good recommendations. |
+| **Popularity** | Zero personalization | Completely fails for niche users. Everyone gets the same list regardless of their taste. |
+
+---
+
+## 5. Bias Analysis
 
 ### Popularity Bias
-The dataset follows a strict Power Law distribution.
-*   **The Findings:** The popularity baseline alone achieved an NDCG@10 of 0.022. This is a very strong baseline. Any Personalized model must fight the urge to simply mimic this baseline.
-*   **Model Behavior:** The Enhanced Content-Based model required a massive popularity weight (0.5) to be competitive. This indicates that for this dataset, "quality" (popularity) is often a better feature than "genre". Item-Item CF naturally biases towards popular items because popular items have more co-occurrences, leading to higher similarity scores. This explains its high accuracy but low coverage.
+
+The Popularity baseline (NDCG@10 = 0.049) is a shockingly strong competitor. This highlights the severity of popularity bias in the dataset: the power-law distribution means popular movies dominate test sets too.
+
+Item-Item CF has the highest popularity bias among Part 1 models (1,681) because popular movies have more co-interactions, inflating their similarity scores. This is why it achieves high accuracy — it recommends movies that are both relevant and popular — but at the cost of 19.7% coverage.
+
+Enhanced CB required a popularity_weight of 0.5 to be competitive. Without it, pure content features underperform. This means half of the Enhanced CB signal is just popularity in disguise.
 
 ### Activity Bias
-*   **Power Users:** The evaluation metric (average across users) prevents power users (who have rated 1000+ movies) from dominating the scores. However, the *training* process of Matrix Factorization is inherently biased towards power users, as they contribute more terms to the loss function. This means the latent factors $Q_i$ (items) are learned primarily to satisfy power users, potentially marginalizing casual users.
 
-## 4. Deployment Strategy
+Per-user averaging in our evaluation prevents power users from dominating metric computation. However, during training, Matrix Factorization (FunkSVD, ALS) inherently over-represents power users: they contribute more terms to the loss function, so the learned item factors Q primarily satisfy power user preferences.
 
-If we were to deploy this system into a production environment today, we would not choose a single model. Instead, we would implement a **Hybrid Switching Strategy**:
+---
 
-### The Architecture
-1.  **Primary Candidate Generator: Item-Item CF**
-    *   **Why:** Best accuracy. Users trust systems that give "right" answers.
-    *   **Implementation:** Pre-compute the Top-50 neighbors for every item offline. At inference time, this becomes a fast O(1) lookup.
+## 6. Design Choices & Struggles
 
-2.  **Fallback / Cold-Start Handler: Content-Based Filtering**
-    *   **Scenario:** When a new movie is added or for items with <50 ratings.
-    *   **Why:** CF cannot handle these. CB uses metadata (genres, year, director) to place the item near similar items immediately.
-    *   **Threshold Rationale:**
-        *   **< 20 ratings (19% of catalog):** This is the statistical noise floor identified in EDA. With fewer than 20 ratings, calculating reliable item-item similarity is mathematically unstable (high noise/variance).
-        *   **20–50 ratings:** Our hyperparameter tuning found $K=50$ to be the optimal neighbor count. Items in this range are in a "warm start" phase—they exist but lack enough history to support a full 50-neighbor calculation, making the Content-Based fallback a safer choice.
+**Jaccard vs. Adjusted Cosine:** We initially expected Adjusted Cosine to win because it uses rating magnitudes. In practice, Jaccard with binary threshold 4.0 was better. Users are inconsistent raters — a 3 from one user means the same as a 4 from another. Binarizing removes this noise.
 
-3.  **Experimental Slot: ALS**
-    *   **Scenario:** Insert 1 or 2 items from the ALS model into the Top-10 list.
-    *   **Why:** To inject diversity and "long tail" discovery. offline metrics punish this, but in an online setting, this drives catalog exploration.
+**MF initialization:** Both FunkSVD and ALS initialize factors from N(0, 0.1). We tested N(0, 0.01) but it converged too slowly. Biases start at 0; the global bias is set to the mean training rating (≈3.58).
 
-### Why not pure Matrix Factorization?
-While FunkSVD is good in theory, its "Rating Prediction" nature is less suited for a "Top-N Recommendation" user interface (like Netflix/Spotify). Users care about "What should I watch?", not "What will be my rating?". Item-Item CF aligns better with this mental model.
+**Why TF-IDF helped CB:** Raw binary genre vectors produce near-identical feature vectors for many movies. TF-IDF re-weights: rare genres (Film-Noir, Documentary) become more discriminative, common genres (Drama, Comedy) get downweighted. Adding a decade feature further helped differentiate movies within the same genre.
 
-## 5. Thoughts & Considerations for Next Steps
+**Numba acceleration:** FunkSVD and ALS without Numba were impractically slow on 1M interactions. JIT compilation brought FunkSVD from minutes to seconds per epoch. ALS's closed-form solve is fast per-user but iterates over 6,040 users and 3,706 items each iteration — still manageable but not instant.
 
-### 1. Implicit vs. Explicit Feedback
-We treated 4.0+ ratings as "positive" and others as negative/noise. In a real-world scenario, we would also incorporate **Implicit Feedback** (clicks, watch time) into the model. As we assume - a user clicking "play" is a stronger signal than a user *not* rating a movie.
+---
 
-### 2. Context-Awareness
-Our current models are static. They ignore:
-*   **Time:** A user watching cartoons on Saturday morning might be doing so for their kids, while watching crime fiction on Friday night is for themselves.
-*   **Sequence:** The user just watched "The Fellowship of the Ring". Recommending "The Two Towers" is obvious, but standard MF might not catch this sequential dependency as strongly as a Sequence-Aware Recommender.
+## 7. Deployment Strategy (Part 1 Only)
 
-### 3. Beyond Genres
-The Content-Based model was weak because "Genre" is a weak feature. Movies are defined by Directors, Actors, Plot keywords, and Visual style.
-*   **Next Step:** Use NLP (BERT/LLMs) on movie plot summaries to generate rich item embeddings, rather than just using TF-IDF on genres.
+Based on Part 1 results alone, we would deploy a **Hybrid Switching Strategy**:
 
-### 4. Online Evaluation
-Offline metrics (NDCG) are proxies. High accuracy on historic data does not guarantee user engagement. The only true test is an **A/B Test** to see if users actually click and watch the recommendations provided by the diverse ALS model versus the safe Item-Item model.
+1. **Primary: Item-Item CF.** Best accuracy. Precompute top-50 neighbors per item offline. At inference time: look up neighbors of the user's liked items, aggregate scores, return top-K. Sub-millisecond.
+
+2. **Cold-start fallback: Enhanced CB.** For new movies or items with <50 ratings, where CF similarity is unreliable. CB can score any item with metadata immediately.
+
+3. **Diversity slot: ALS.** Insert 1–2 ALS recommendations into the final list to promote discovery of lesser-known movies. Offline metrics punish this, but in a live system it drives valuable catalog exploration.
+
+This strategy is superseded by the Part 2 deployment recommendation (Two-Tower + Hybrid Reranking) once BPR and neural models are available.
+
+---
+
+## 8. Next Steps (Addressed in Part 2)
+
+- **Objective alignment:** Replace MSE with a pairwise ranking loss (BPR) to directly optimize what we measure.
+- **Hybrid models:** Combine collaborative and content signals to address cold-start without sacrificing accuracy.
+- **Neural architectures:** Explore whether deep learning can improve on linear factorization.
+- **Online evaluation:** Move beyond static offline metrics to simulate live traffic routing with bandits.
